@@ -642,7 +642,8 @@ class App(ctk.CTk):
             "orientation": self.opt_orient.get(),
             "color_mode": "monochrome" if "Blanco y Negro" in color_val else "color",
             "selected_layouts": selected_layouts if mode == "layouts" else None,
-            "selected_sheets": selected_sheets if mode == "modelspace" else None
+            "selected_sheets": selected_sheets if mode == "modelspace" else None,
+            "temp_dxf_path": self.temp_dxf_path
         }
 
         # Traducir orientación

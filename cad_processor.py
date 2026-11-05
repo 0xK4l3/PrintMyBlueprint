@@ -10,22 +10,78 @@ from ezdxf.addons.drawing import Frontend, RenderContext, layout
 from ezdxf.addons.drawing.pymupdf import PyMuPdfBackend
 from ezdxf.addons.drawing.config import Configuration, ColorPolicy, BackgroundPolicy
 from ezdxf.math import BoundingBox2d
+from ezdxf.entities.dxfobj import SortEntsTable
 import pymupdf
+
+# Parchear SortEntsTable.load_table de ezdxf para tolerar tablas SORTENTSTABLE
+# con códigos de handle corruptos generados por LibreDWG (ej. código 331 en vez de 5).
+_orig_sort_ents_load_table = SortEntsTable.load_table
+
+def _safe_sort_ents_load_table(self, tags):
+    try:
+        return _orig_sort_ents_load_table(self, tags)
+    except Exception:
+        pass
+
+SortEntsTable.load_table = _safe_sort_ents_load_table
+
+
+def _normalize_layout_viewports(doc):
+    """
+    Normaliza los atributos 'status' e 'id' de las entidades VIEWPORT en los Layouts.
+    LibreDWG suele exportar los viewports con status=0 e id=0, lo que provoca que ezdxf
+    los considere invisibles/inactivos y no renderice el contenido del Espacio Modelo.
+    """
+    try:
+        for lay in doc.layouts:
+            if lay.name == "Model":
+                continue
+            vps = list(lay.query("VIEWPORT"))
+            for idx, vp in enumerate(vps):
+                if idx == 0:
+                    # El primer viewport representa la cámara general del Paper Space
+                    vp.dxf.status = 1
+                    if vp.dxf.get("id", 0) <= 0:
+                        vp.dxf.id = 1
+                else:
+                    if vp.dxf.get("status", 0) <= 1:
+                        vp.dxf.status = idx + 1
+                    if vp.dxf.get("id", 0) <= 1:
+                        vp.dxf.id = idx + 1
+    except Exception:
+        pass
+
+
+_DXF_DOC_CACHE = {"path": None, "mtime": None, "doc": None}
+
 
 def safe_read_dxf(dxf_path):
     """
     Intenta leer el archivo DXF de forma súper rápida usando ezdxf.readfile estándar.
     Si falla (por ejemplo, debido a corrupción de cabecera), recurre a recover.readfile
     para reparar estructuras de coordenadas dañadas de forma automática.
+    Incluye caché en memoria para evitar releer el mismo archivo temporal repetidamente.
     """
+    try:
+        mtime = os.path.getmtime(dxf_path)
+        if _DXF_DOC_CACHE["path"] == dxf_path and _DXF_DOC_CACHE["mtime"] == mtime and _DXF_DOC_CACHE["doc"] is not None:
+            return _DXF_DOC_CACHE["doc"]
+    except Exception:
+        mtime = None
+
     try:
         # ezdxf.readfile estándar es entre 3 y 5 veces más rápido porque no realiza
         # la auditoría completa ni reparación de entidades excepto si es estrictamente necesario.
-        return ezdxf.readfile(dxf_path)
+        doc = ezdxf.readfile(dxf_path)
+        _normalize_layout_viewports(doc)
+        _DXF_DOC_CACHE.update({"path": dxf_path, "mtime": mtime, "doc": doc})
+        return doc
     except Exception as e:
         print(f"Lectura estándar falló: {e}. Intentando recuperación automática con auditoría...")
         try:
             doc, auditor = recover.readfile(dxf_path)
+            _normalize_layout_viewports(doc)
+            _DXF_DOC_CACHE.update({"path": dxf_path, "mtime": mtime, "doc": doc})
             return doc
         except Exception:
             raise e
@@ -208,9 +264,19 @@ def pre_analyze_dxf(dxf_path):
     doc = safe_read_dxf(dxf_path)
     msp = doc.modelspace()
     
-    # 1. Pestañas de presentación (Layouts)
-    # Excluimos "Model" porque es el espacio modelo
-    layouts = [lay.name for lay in doc.layouts if lay.name != "Model"]
+    # 1. Pestañas de presentación (Layouts) con contenido real
+    # Excluimos "Model" y descartamos layouts por defecto vacíos (sin geometrías ni viewports al modelo)
+    layouts = []
+    for lay in doc.layouts:
+        if lay.name == "Model":
+            continue
+        entities_list = list(lay)
+        if not entities_list:
+            continue
+        non_vp = [e for e in entities_list if e.dxftype() != "VIEWPORT"]
+        vps = [e for e in entities_list if e.dxftype() == "VIEWPORT"]
+        if len(non_vp) > 0 or len(vps) > 1:
+            layouts.append(lay.name)
     
     # 2. Bloques en espacio modelo
     block_counts = {}
@@ -270,9 +336,9 @@ def sort_boxes(boxes):
 def get_polyline_points(entity):
     """Obtiene los puntos 2D de una polilínea (LWPOLYLINE o POLYLINE)."""
     if entity.dxftype() == 'LWPOLYLINE':
-        return [p[:2] for p in entity.get_points()]
+        return [(float(p[0]), float(p[1])) for p in entity.get_points()]
     elif entity.dxftype() == 'POLYLINE':
-        return [p.dxf.location[:2] for p in entity.vertices]
+        return [(float(p.dxf.location.x), float(p.dxf.location.y)) for p in entity.vertices]
     return []
 
 def is_geometrically_closed(entity):
@@ -281,10 +347,16 @@ def is_geometrically_closed(entity):
     incluso si su bandera is_closed es False en AutoCAD.
     Usa una tolerancia dinámica basada en las unidades del dibujo (5 mm).
     """
-    if entity.is_closed:
-        return True
+    try:
+        if entity.is_closed:
+            return True
+    except Exception:
+        pass
     if entity.dxftype() in ('LWPOLYLINE', 'POLYLINE'):
-        points = get_polyline_points(entity)
+        try:
+            points = get_polyline_points(entity)
+        except Exception:
+            return False
         if len(points) >= 3:
             p1 = points[0]
             p2 = points[-1]
@@ -313,6 +385,15 @@ def is_geometrically_closed(entity):
             return math.hypot(p1[0] - p2[0], p1[1] - p2[1]) < tolerance
     return False
 
+def _intersection_area(b1, b2):
+    x_min = max(b1.extmin.x, b2.extmin.x)
+    y_min = max(b1.extmin.y, b2.extmin.y)
+    x_max = min(b1.extmax.x, b2.extmax.x)
+    y_max = min(b1.extmax.y, b2.extmax.y)
+    if x_min < x_max and y_min < y_max:
+        return (x_max - x_min) * (y_max - y_min)
+    return 0.0
+
 def filter_nested_boxes(boxes):
     """
     Filtra rectángulos concéntricos o anidados (ej. borde exterior del papel y margen interno).
@@ -335,22 +416,108 @@ def filter_nested_boxes(boxes):
             continue
             
         for kept in unique_boxes:
-            # Calcular el área de intersección entre box y kept
-            x_min = max(kept.extmin.x, box.extmin.x)
-            y_min = max(kept.extmin.y, box.extmin.y)
-            x_max = min(kept.extmax.x, box.extmax.x)
-            y_max = min(kept.extmax.y, box.extmax.y)
-            
-            if x_min < x_max and y_min < y_max:
-                inter_area = (x_max - x_min) * (y_max - y_min)
-                # Si más del 70% del área de box está contenida dentro de kept, se considera anidado/interno
-                if inter_area > 0.7 * area_box:
-                    is_nested = True
-                    break
+            inter_area = _intersection_area(kept, box)
+            # Si más del 70% del área de box está contenida dentro de kept, se considera anidado/interno
+            if inter_area > 0.7 * area_box:
+                is_nested = True
+                break
         if not is_nested:
             unique_boxes.append(box)
             
     return unique_boxes
+
+def _merge_collinear_1d(lines, coord_key, min_key, max_key, coord_tol, gap_tol):
+    """
+    Une segmentos colineales que se tocan o solapan para reconstruir bordes
+    de planos divididos en varios segmentos LINE. Conserva tanto los segmentos
+    originales como los fusionados para soportar grillas de planos contiguos.
+    """
+    if not lines:
+        return []
+    sorted_lines = sorted(lines, key=lambda l: (l[coord_key], l[min_key]))
+    merged_extra = []
+    n = len(sorted_lines)
+    i = 0
+    while i < n:
+        group = [sorted_lines[i]]
+        j = i + 1
+        while j < n and abs(sorted_lines[j][coord_key] - sorted_lines[i][coord_key]) <= coord_tol:
+            group.append(sorted_lines[j])
+            j += 1
+        if len(group) > 1:
+            group.sort(key=lambda l: l[min_key])
+            cur_min = group[0][min_key]
+            cur_max = group[0][max_key]
+            cur_coord_sum = group[0][coord_key]
+            cur_count = 1
+            layer = group[0]["layer"]
+            for seg in group[1:]:
+                if seg[min_key] <= cur_max + gap_tol:
+                    cur_max = max(cur_max, seg[max_key])
+                    cur_coord_sum += seg[coord_key]
+                    cur_count += 1
+                else:
+                    if cur_count > 1:
+                        merged_extra.append({
+                            coord_key: cur_coord_sum / cur_count,
+                            min_key: cur_min,
+                            max_key: cur_max,
+                            "length": cur_max - cur_min,
+                            "layer": layer
+                        })
+                    cur_min = seg[min_key]
+                    cur_max = seg[max_key]
+                    cur_coord_sum = seg[coord_key]
+                    cur_count = 1
+                    layer = seg["layer"]
+            if cur_count > 1:
+                merged_extra.append({
+                    coord_key: cur_coord_sum / cur_count,
+                    min_key: cur_min,
+                    max_key: cur_max,
+                    "length": cur_max - cur_min,
+                    "layer": layer
+                })
+        i = j
+    return lines + merged_extra
+
+def _fast_msp_extents(msp, cache=None):
+    """
+    Calcula la extensión general del Espacio Modelo de manera ultrarrápida a partir
+    de los vértices de líneas y polilíneas, evitando evaluar miles de textos y sombreados.
+    """
+    from ezdxf.math import BoundingBox2d, Vec2
+    xs = []
+    ys = []
+    for line in msp.query('LINE'):
+        try:
+            s = line.dxf.start
+            e = line.dxf.end
+            if not (math.isnan(s.x) or math.isnan(s.y) or math.isinf(s.x) or math.isinf(s.y)):
+                xs.append(s.x)
+                ys.append(s.y)
+            if not (math.isnan(e.x) or math.isnan(e.y) or math.isinf(e.x) or math.isinf(e.y)):
+                xs.append(e.x)
+                ys.append(e.y)
+        except Exception:
+            pass
+    for poly in msp.query('LWPOLYLINE POLYLINE'):
+        try:
+            for px, py in get_polyline_points(poly):
+                if not (math.isnan(px) or math.isnan(py) or math.isinf(px) or math.isinf(py)):
+                    xs.append(px)
+                    ys.append(py)
+        except Exception:
+            pass
+    if xs and ys:
+        box = BoundingBox2d([Vec2(min(xs), min(ys)), Vec2(max(xs), max(ys))])
+        if is_valid_bbox(box):
+            return box
+    try:
+        return bbox.extents(msp, cache=cache)
+    except Exception:
+        return None
+
 
 def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
     """
@@ -358,7 +525,7 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
     de entidades LINE individuales de manera ultra rápida (O(H^2 log V)).
     Usa una longitud de línea mínima calculada dinámicamente según la escala del dibujo.
     """
-    from ezdxf.math import BoundingBox2d, Vec2
+    from ezdxf.math import BoundingBox2d, Vec2, Vec3
     import math
     import bisect
     
@@ -378,7 +545,6 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
             points = get_polyline_points(poly)
             if len(points) >= 2:
                 is_closed = poly.is_closed or is_geometrically_closed(poly)
-                from ezdxf.math import Vec3
                 for i in range(len(points) - 1):
                     p1 = Vec3(points[i][0], points[i][1], 0)
                     p2 = Vec3(points[i+1][0], points[i+1][1], 0)
@@ -401,8 +567,8 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
         
     # Calcular extensión general del Espacio Modelo
     try:
-        msp_box = bbox.extents(msp, cache=cache)
-        if msp_box.has_data:
+        msp_box = _fast_msp_extents(msp, cache=cache)
+        if msp_box and msp_box.has_data:
             w_msp = msp_box.extmax.x - msp_box.extmin.x
             h_msp = msp_box.extmax.y - msp_box.extmin.y
             max_dim = max(w_msp, h_msp)
@@ -411,13 +577,12 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
     except Exception:
         max_dim = 1000.0
 
-    # Heurística: Si las unidades no están especificadas (0) pero las dimensiones
-    # generales son pequeñas, asumimos metros (6). De lo contrario, mm (4).
-    if insunits == 0:
-        if max_dim < 300.0:
-            insunits = 6
-        else:
-            insunits = 4
+    # Heurística: Si las dimensiones generales son pequeñas (< 300), el dibujo está en metros (6),
+    # incluso si la plantilla de AutoCAD dejó INSUNITS en 4 (mm) o 0 (sin especificar).
+    if max_dim < 300.0 and insunits in (0, 4):
+        insunits = 6
+    elif insunits == 0:
+        insunits = 4
             
     # Obtener el factor de conversión: 1 unidad del dibujo = X milímetros
     units_to_mm = {
@@ -438,13 +603,12 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
     # Pero no debe ser mayor que el 15% del tamaño total para dibujos muy pequeños, ni menor que 0.05 unidades locales.
     min_line_length = min(min_line_length, max_dim * 0.15)
     min_line_length = max(0.05, min_line_length)
+    
+    # Mínimo absoluto de tolerancia física (10 mm) en unidades del dibujo
+    min_tol = 10.0 / scale_to_mm
         
     v_lines = []
     h_lines = []
-    
-    # Tolerancia angular para líneas verticales/horizontales (en unidades del dibujo)
-    # 0.5 unidades de dibujo es bastante permisivo para rotaciones leves.
-    tol = 0.5 
     
     for start_pt, end_pt, layer in all_segments:
         p1 = start_pt
@@ -452,13 +616,17 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
         
         dx = abs(p1.x - p2.x)
         dy = abs(p1.y - p2.y)
-        length = math.hypot(p1.x - p2.x, p1.y - p2.y)
+        length = math.hypot(dx, dy)
         
         # Omitir segmentos que son más cortos que el límite dinámico
         if length < min_line_length:
             continue
             
-        if dx < tol:  # Vertical
+        # Tolerancia angular adaptativa a la escala (máx 1% de inclinación o 0.5 unidades en mm)
+        tol = min(0.5 / scale_to_mm, length * 0.02)
+        tol = max(tol, 1e-4)
+            
+        if dx <= tol and dx < dy:  # Vertical
             y_min = min(p1.y, p2.y)
             y_max = max(p1.y, p2.y)
             v_lines.append({
@@ -468,7 +636,7 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
                 "length": y_max - y_min,
                 "layer": layer
             })
-        elif dy < tol:  # Horizontal
+        elif dy <= tol and dy < dx:  # Horizontal
             x_min = min(p1.x, p2.x)
             x_max = max(p1.x, p2.x)
             h_lines.append({
@@ -478,6 +646,10 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
                 "length": x_max - x_min,
                 "layer": layer
             })
+            
+    # Unir segmentos colineales partidos (manteniendo también los individuales)
+    v_lines = _merge_collinear_1d(v_lines, "x", "y_min", "y_max", min_tol * 0.2, min_tol * 0.5)
+    h_lines = _merge_collinear_1d(h_lines, "y", "x_min", "x_max", min_tol * 0.2, min_tol * 0.5)
             
     # Indexar líneas verticales por X para búsquedas binarias ultrarrápidas
     v_sorted = sorted(v_lines, key=lambda l: l["x"])
@@ -496,9 +668,6 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
         return False
 
     rect_candidates = []
-    
-    # Mínimo absoluto de tolerancia física (10 mm) en unidades del dibujo
-    min_tol = 10.0 / scale_to_mm
     
     # Emparejar líneas horizontales (tienen que compartir X similar y estar en Y distintos)
     h_count = len(h_lines)
@@ -548,7 +717,48 @@ def find_rectangles_from_lines(msp, min_size=(0.05, 0.05), cache=None):
                 
     return rect_candidates
 
-def detect_sheets_in_modelspace(dxf_path, method="auto", block_name=None, layer_name=None, min_size=(0.05, 0.05), sort_sheets=True):
+
+def extract_modelspace_boxes_from_viewports(doc):
+    """
+    Extrae las regiones del Espacio Modelo hacia las que apuntan los VIEWPORTs
+    de las pestañas de presentación (Layouts). Es útil como respaldo cuando el dibujo
+    en el Espacio Modelo no tiene marcos de lámina dibujados directamente allí,
+    sino que los cortes de hoja están definidos por los Viewports de los Layouts.
+    """
+    from ezdxf.math import BoundingBox2d, Vec2, Vec3
+    vp_entries = []
+    for lay in doc.layouts:
+        if lay.name == "Model":
+            continue
+        vps = list(lay.query("VIEWPORT"))
+        for idx, vp in enumerate(vps):
+            if idx == 0:
+                continue  # Omitir cámara global del Paper Space
+            try:
+                vh = float(vp.dxf.get("view_height", 0.0))
+                pw = float(vp.dxf.get("width", 0.0))
+                ph = float(vp.dxf.get("height", 0.0))
+                if vh > 1e-2 and pw > 1e-2 and ph > 1e-2:
+                    vw = vh * (pw / ph)
+                    vt = vp.dxf.get("view_target_point", Vec3(0, 0, 0))
+                    vc = vp.dxf.get("view_center_point", Vec3(0, 0, 0))
+                    cx = float(vt.x + vc.x)
+                    cy = float(vt.y + vc.y)
+                    # Ignorar viewports por defecto que apuntan al origen vacío cuando el modelo está lejos
+                    box = BoundingBox2d([Vec2(cx - vw / 2.0, cy - vh / 2.0), Vec2(cx + vw / 2.0, cy + vh / 2.0)])
+                    if is_valid_bbox(box):
+                        vp_entries.append((box, pw * ph))
+            except Exception:
+                pass
+    if not vp_entries:
+        return []
+    # Conservar únicamente los viewports principales de lámina (>= 35% del área en papel del mayor)
+    max_paper_area = max(pa for _, pa in vp_entries)
+    main_boxes = [b for b, pa in vp_entries if pa >= 0.35 * max_paper_area]
+    return filter_nested_boxes(main_boxes)
+
+
+def detect_sheets_in_modelspace(dxf_path, method="auto", block_name=None, layer_name=None, min_size=(0.05, 0.05), sort_sheets=True, allow_viewport_fallback=True):
     """
     Detecta áreas de planos en el Espacio Modelo del DXF.
     Retorna una lista de objetos BoundingBox2d ordenados y filtrados.
@@ -563,6 +773,21 @@ def detect_sheets_in_modelspace(dxf_path, method="auto", block_name=None, layer_
     except Exception:
         insunits = 4  # mm por defecto
         
+    try:
+        msp_box = _fast_msp_extents(msp, cache=cache)
+        if msp_box and msp_box.has_data:
+            max_dim = max(msp_box.extmax.x - msp_box.extmin.x, msp_box.extmax.y - msp_box.extmin.y)
+        else:
+            max_dim = 1000.0
+    except Exception:
+        msp_box = None
+        max_dim = 1000.0
+        
+    if max_dim < 300.0 and insunits in (0, 4):
+        insunits = 6
+    elif insunits == 0:
+        insunits = 4
+        
     # Obtener el factor de conversión: 1 unidad del dibujo = X milímetros
     units_to_mm = {
         1: 25.4,     # Inches
@@ -575,22 +800,6 @@ def detect_sheets_in_modelspace(dxf_path, method="auto", block_name=None, layer_
         10: 914.4,   # Yards
     }
     scale_to_mm = units_to_mm.get(insunits, 1.0)
-    
-    # Si las unidades son 0 (unspecified), estimar en base a las dimensiones generales
-    if insunits == 0:
-        try:
-            msp_box = bbox.extents(msp, cache=cache)
-            if msp_box.has_data:
-                max_dim = max(msp_box.extmax.x - msp_box.extmin.x, msp_box.extmax.y - msp_box.extmin.y)
-            else:
-                max_dim = 1000.0
-        except Exception:
-            max_dim = 1000.0
-            
-        if max_dim < 300.0:
-            scale_to_mm = 1000.0  # Asumir metros
-        else:
-            scale_to_mm = 1.0     # Asumir milímetros
             
     # El tamaño mínimo de una hoja debe ser de al menos 150mm x 150mm en unidades del dibujo
     min_size_units = (150.0 / scale_to_mm, 150.0 / scale_to_mm)
@@ -653,7 +862,7 @@ def detect_sheets_in_modelspace(dxf_path, method="auto", block_name=None, layer_
                         ratio = max(w, h) / min(w, h)
                         if 1.0 <= ratio <= 6.0:
                             candidates.append(entity_box)
-                except Exception as e:
+                except Exception:
                     pass
                     
         # 2. Buscar rectángulos compuestos por líneas sueltas
@@ -676,19 +885,32 @@ def detect_sheets_in_modelspace(dxf_path, method="auto", block_name=None, layer_
                     # Relación de aspecto entre 1.0 y 6.0 para láminas
                     if 1.0 <= ratio <= 6.0:
                         candidates.append(entity_box)
-            except Exception as e:
+            except Exception:
                 pass
                     
-    # Filtrar por área relativa para conservar solo formatos grandes (láminas)
-    # y descartar detalles, notas o tablas de menor tamaño
+    # Filtrar por área relativa para conservar formatos de láminas (incluyendo mezclas p.ej. A1/A2 o láminas de distinto ancho)
+    # y descartar detalles pequeños, cajetines sueltos, notas o tablas de menor tamaño
     if candidates:
         areas = [(b.extmax.x - b.extmin.x) * (b.extmax.y - b.extmin.y) for b in candidates]
         max_area = max(areas)
-        candidates = [box for box, area in zip(candidates, areas) if area >= 0.8 * max_area]
+        candidates = [box for box, area in zip(candidates, areas) if area >= 0.5 * max_area]
 
     # Filtrar rectángulos anidados (ej. conservar solo el marco exterior)
     if candidates:
         candidates = filter_nested_boxes(candidates)
+        
+    # Respaldo: Si en modo automático no hay marcos explícitos en el Espacio Modelo,
+    # verificar si los Layouts definen cortes sobre el Espacio Modelo mediante VIEWPORTs
+    if not candidates and method == "auto" and allow_viewport_fallback:
+        vp_boxes = extract_modelspace_boxes_from_viewports(doc)
+        if msp_box and is_valid_bbox(msp_box):
+            # Conservar únicamente los viewports que intersectan realmente con la geometría del Espacio Modelo
+            vp_boxes = [b for b in vp_boxes if _intersection_area(b, msp_box) > 0]
+        if vp_boxes:
+            candidates = vp_boxes
+        elif msp_box and is_valid_bbox(msp_box):
+            # Último respaldo: encuadre completo del Espacio Modelo
+            candidates = [msp_box]
         
     if sort_sheets:
         candidates = sort_boxes(candidates)
@@ -707,16 +929,23 @@ def process_file_to_pdf(dwg_path, output_pdf_path, config, progress_callback=Non
     - combine_pdf: (bool) si se combinan en un solo PDF o se guardan por separado
     - orientation: "auto", "landscape" o "portrait"
     """
-    # Crear un archivo temporal con nombre seguro en formato ASCII
-    temp_dir = tempfile.gettempdir()
-    dxf_name = f"temp_blueprint_process_{os.getpid()}_{int(time.time())}.dxf"
-    temp_dxf_path = os.path.join(temp_dir, dxf_name)
+    existing_dxf = config.get("temp_dxf_path")
+    reuse_dxf = bool(existing_dxf and os.path.exists(existing_dxf))
+    if reuse_dxf:
+        temp_dxf_path = existing_dxf
+    else:
+        temp_dir = tempfile.gettempdir()
+        dxf_name = f"temp_blueprint_process_{os.getpid()}_{int(time.time())}.dxf"
+        temp_dxf_path = os.path.join(temp_dir, dxf_name)
     
     try:
-        if progress_callback:
-            progress_callback("Convirtiendo DWG a DXF...", 0.1)
-            
-        convert_dwg_to_dxf(dwg_path, temp_dxf_path)
+        if not reuse_dxf:
+            if progress_callback:
+                progress_callback("Convirtiendo DWG a DXF...", 0.1)
+            convert_dwg_to_dxf(dwg_path, temp_dxf_path)
+        else:
+            if progress_callback:
+                progress_callback("Preparando documento DXF...", 0.1)
         
         doc = safe_read_dxf(temp_dxf_path)
         ctx = RenderContext(doc)
@@ -799,6 +1028,15 @@ def process_file_to_pdf(dwg_path, output_pdf_path, config, progress_callback=Non
             total_sheets = len(sheets)
             msp = doc.modelspace()
             
+            color_mode = config.get("color_mode", "color")
+            draw_config = Configuration(
+                background_policy=BackgroundPolicy.WHITE,
+                color_policy=ColorPolicy.BLACK if color_mode == "monochrome" else ColorPolicy.COLOR
+            )
+            master_backend = PyMuPdfBackend()
+            Frontend(ctx, master_backend, config=draw_config).draw_layout(msp)
+            render_settings = layout.Settings(crop_at_margins=True)
+            
             for idx, sheet_box in enumerate(sheets):
                 if progress_callback:
                     progress_callback(f"Renderizando plano {idx+1}/{total_sheets}...", 0.4 + (idx/total_sheets)*0.5)
@@ -820,16 +1058,23 @@ def process_file_to_pdf(dwg_path, output_pdf_path, config, progress_callback=Non
                     
                 page = layout.Page(page_w, page_h, layout.Units.mm, margins=layout.Margins.all(5))
                 
-                backend = PyMuPdfBackend()
-                color_mode = config.get("color_mode", "color")
-                draw_config = Configuration(
-                    background_policy=BackgroundPolicy.WHITE,
-                    color_policy=ColorPolicy.BLACK if color_mode == "monochrome" else ColorPolicy.COLOR
+                # Copiar grabación maestra y recortar al encuadre de la hoja (con margen 0.5% para el grosor del borde)
+                player_copy = master_backend.player().copy()
+                pad_x = w * 0.005
+                pad_y = h * 0.005
+                player_copy.crop_rect(
+                    (sheet_box.extmin.x - pad_x, sheet_box.extmin.y - pad_y),
+                    (sheet_box.extmax.x + pad_x, sheet_box.extmax.y + pad_y),
+                    min(w, h) * 0.001
                 )
-                Frontend(ctx, backend, config=draw_config).draw_layout(msp)
+                backend = PyMuPdfBackend()
+                backend.config = player_copy.config
+                backend.background = player_copy.background
+                backend.records = player_copy.records
+                backend.properties = player_copy.properties
                 
                 try:
-                    pdf_bytes = backend.get_pdf_bytes(page, render_box=sheet_box)
+                    pdf_bytes = backend.get_pdf_bytes(page, settings=render_settings, render_box=sheet_box)
                     pdf_pages_bytes.append((f"Plano_{idx+1}", pdf_bytes))
                 except ValueError as ve:
                     if "empty" in str(ve).lower() or "bounding box" in str(ve).lower():
@@ -873,8 +1118,8 @@ def process_file_to_pdf(dwg_path, output_pdf_path, config, progress_callback=Non
         return output_files
         
     finally:
-        # Asegurar limpieza del archivo DXF temporal
-        if os.path.exists(temp_dxf_path):
+        # Asegurar limpieza del archivo DXF temporal si fue creado exclusivamente para este proceso
+        if not reuse_dxf and os.path.exists(temp_dxf_path):
             try:
                 os.remove(temp_dxf_path)
             except Exception:
@@ -921,7 +1166,17 @@ def get_preview_image(dxf_path, item_type, item_value, color_mode="color"):
         is_landscape = w > h
         page_w, page_h = (297, 210) if is_landscape else (210, 297)
         page = layout.Page(page_w, page_h, layout.Units.mm, margins=layout.Margins.all(5))
-        pdf_bytes = backend.get_pdf_bytes(page, render_box=sheet_box)
+        
+        player_copy = backend.player().copy()
+        pad_x = w * 0.005
+        pad_y = h * 0.005
+        player_copy.crop_rect(
+            (sheet_box.extmin.x - pad_x, sheet_box.extmin.y - pad_y),
+            (sheet_box.extmax.x + pad_x, sheet_box.extmax.y + pad_y),
+            min(w, h) * 0.001
+        )
+        backend.records = player_copy.records
+        pdf_bytes = backend.get_pdf_bytes(page, settings=layout.Settings(crop_at_margins=True), render_box=sheet_box)
         
     # Abrir el PDF generado en memoria y renderizarlo a imagen
     pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
